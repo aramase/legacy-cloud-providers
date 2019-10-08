@@ -82,7 +82,7 @@ func (c *controllerCommon) getNodeVMSet(nodeName types.NodeName) (VMSet, error) 
 	}
 
 	// 3. If the node is managed by availability set, then return ss.availabilitySet.
-	managedByAS, err := ss.isNodeManagedByAvailabilitySet(mapNodeNameToVMName(nodeName))
+	managedByAS, err := ss.isNodeManagedByAvailabilitySet(mapNodeNameToVMName(nodeName), allowUnsafeRead)
 	if err != nil {
 		return nil, err
 	}

@@ -26,6 +26,17 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+const (
+	// cachedData returns data from cache if cache entry not expired
+	// if cache entry expired, then it will refetch the data using getter
+	// save the entry in cache and then return
+	cachedData = iota
+	// allowUnsafeRead returns data from cache even if the cache entry is
+	// active/expired. If entry doesn't exist in cache, then data is fetched
+	// using getter, saved in cache and returned
+	allowUnsafeRead
+)
+
 // getFunc defines a getter function for timedCache.
 type getFunc func(key string) (interface{}, error)
 
@@ -36,6 +47,8 @@ type cacheEntry struct {
 
 	// The lock to ensure not updating same entry simultaneously.
 	lock sync.Mutex
+	// last time the cache was updated
+	lastUpdate time.Time
 }
 
 // cacheKeyFunc defines the key function required in TTLStore.
@@ -48,6 +61,7 @@ type timedCache struct {
 	store  cache.Store
 	lock   sync.Mutex
 	getter getFunc
+	ttl    time.Duration
 }
 
 // newTimedcache creates a new timedCache.
@@ -58,19 +72,29 @@ func newTimedcache(ttl time.Duration, getter getFunc) (*timedCache, error) {
 
 	return &timedCache{
 		getter: getter,
-		store:  cache.NewTTLStore(cacheKeyFunc, ttl),
+		store:  cache.NewStore(cacheKeyFunc),
+		ttl:    ttl,
 	}, nil
 }
 
 // getInternal returns cacheEntry by key. If the key is not cached yet,
 // it returns a cacheEntry with nil data.
-func (t *timedCache) getInternal(key string) (*cacheEntry, error) {
+func (t *timedCache) getInternal(key string, readType int) (*cacheEntry, error) {
 	entry, exists, err := t.store.GetByKey(key)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		return entry.(*cacheEntry), nil
+		cachedEntry := entry.(*cacheEntry)
+
+		switch readType {
+		case cachedData:
+			if time.Since(cachedEntry.lastUpdate) < t.ttl {
+				return cachedEntry, nil
+			}
+		case allowUnsafeRead:
+			return cachedEntry, nil
+		}
 	}
 
 	t.lock.Lock()
@@ -80,7 +104,16 @@ func (t *timedCache) getInternal(key string) (*cacheEntry, error) {
 		return nil, err
 	}
 	if exists {
-		return entry.(*cacheEntry), nil
+		cachedEntry := entry.(*cacheEntry)
+
+		switch readType {
+		case cachedData:
+			if !(time.Since(cachedEntry.lastUpdate) > t.ttl) {
+				return cachedEntry, nil
+			}
+		case allowUnsafeRead:
+			return cachedEntry, nil
+		}
 	}
 
 	// Still not found, add new entry with nil data.
@@ -94,14 +127,16 @@ func (t *timedCache) getInternal(key string) (*cacheEntry, error) {
 }
 
 // Get returns the requested item by key.
-func (t *timedCache) Get(key string) (interface{}, error) {
-	entry, err := t.getInternal(key)
+func (t *timedCache) Get(key string, readType int) (interface{}, error) {
+	entry, err := t.getInternal(key, readType)
 	if err != nil {
 		return nil, err
 	}
 
 	// Data is still not cached yet, cache it by getter.
 	if entry.data == nil {
+		// entry is locked before getting to ensure
+		// concurrent gets don't result in multiple ARM calls.
 		entry.lock.Lock()
 		defer entry.lock.Unlock()
 
@@ -111,7 +146,10 @@ func (t *timedCache) Get(key string) (interface{}, error) {
 				return nil, err
 			}
 
+			// set the data in cache and also set the last update time
+			// to now as the data was recently fetched
 			entry.data = data
+			entry.lastUpdate = time.Now().UTC()
 		}
 	}
 
@@ -129,7 +167,8 @@ func (t *timedCache) Delete(key string) error {
 // It is only used for testing.
 func (t *timedCache) Set(key string, data interface{}) {
 	t.store.Add(&cacheEntry{
-		key:  key,
-		data: data,
+		key:        key,
+		data:       data,
+		lastUpdate: time.Now().UTC(),
 	})
 }
